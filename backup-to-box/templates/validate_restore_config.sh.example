@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Per-project configuration for validate_restore.sh
+# Copy this file to your project's backup/ directory and customize.
+
+# ─── Required ───────────────────────────────────────────────────────────────
+PROJECT_NAME="financial-tracker"
+DUMP_PATTERN="financial_tracker_*.dump"
+BOX_REMOTE_PATH="box:financial-tracker/db-backups/"
+DB_USER="financial_tracker"
+DB_NAME="financial_tracker"
+DOCKER_IMAGE="postgres:16"
+
+# All tables expected in the restored DB (space-separated)
+VALIDATE_TABLES="transactions vendors emails email_attachments vendor_patterns
+  source_accounts invoices invoice_payments documents properties projects
+  decision_log snapshots matching_rules submitted_reports
+  line_items line_item_sources"
+
+# ─── Optional ───────────────────────────────────────────────────────────────
+
+# Tables to checksum (must match CHECKSUM_TABLES in backup.sh)
+CHECKSUM_TABLES="transactions vendors submitted_reports"
+
+# Path to project-specific canary queries (Level 4 functional tests)
+# Set to "" to skip functional verification
+CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VALIDATE_SQL="${CONFIG_DIR}/validate_queries.sql"
+
+# Path to project backups directory (where .last_restore_validation is written)
+BACKUP_DIR="${CONFIG_DIR}/../backups"
+
+# Gmail alerter (defaults to skill's standalone version)
+ALERT_SCRIPT="$HOME/.claude/skills/backup-to-box/templates/send_alert_standalone.py"

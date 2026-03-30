@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Weekly Restore Validation
+# Downloads the latest backup from Box, restores to a throwaway Docker
+# container, and verifies data integrity at four levels:
+#   L1: Structural — pg_restore succeeds, all tables/indexes/constraints exist
+#   L2: Quantitative — row counts match .counts sidecar exactly
+#   L3: Content — aggregate checksums match .counts sidecar exactly
+#   L4: Functional — optional project-specific canary queries pass
+#
+# EVERYTHING happens in a temp directory. Nothing touches project files,
+# production DB, or existing code. Temp dir and container are destroyed on exit.
+#
+# Usage: validate_restore.sh /path/to/backup/validate_restore_config.sh
+# Cron:  0 14 * * 0  (Sunday 2pm; stagger 30min between projects)
+
+export PATH="/opt/homebrew/opt/libpq/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+
+# macOS coreutils installs as gtimeout; alias for portability
+if ! command -v timeout &>/dev/null && command -v gtimeout &>/dev/null; then
+    timeout() { gtimeout "$@"; }
+fi
+
+# ─── Load project config ───
+
+CONFIG_FILE="${1:-}"
+if [ -z "$CONFIG_FILE" ] || [ ! -f "$CONFIG_FILE" ]; then
+    echo "Usage: $0 /path/to/validate_restore_config.sh" >&2
+    exit 1
+fi
+source "$CONFIG_FILE"
+
+# Required config vars (fail fast if missing)
+: "${PROJECT_NAME:?}" "${DUMP_PATTERN:?}" "${BOX_REMOTE_PATH:?}"
+: "${DB_USER:?}" "${DB_NAME:?}" "${DOCKER_IMAGE:=postgres:16}"
+: "${VALIDATE_TABLES:?}"
+
+CHECKSUM_TABLES="${CHECKSUM_TABLES:-}"
+VALIDATE_SQL="${VALIDATE_SQL:-}"
+ALERT_SCRIPT="${ALERT_SCRIPT:-$HOME/.claude/skills/backup-to-box/templates/send_alert_standalone.py}"
+BACKUP_DIR="${BACKUP_DIR:-$(dirname "$CONFIG_FILE")/../backups}"
+
+TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
+RESTORE_CONTAINER="restore_validate_${PROJECT_NAME}_$$"
+RESTORE_PASSWORD="validate_temp_$$"
+WORK_DIR=""
+RESTORE_PORT=""
+
+# ─── Instance locking ───
+
+LOCK_FILE="/tmp/${PROJECT_NAME}-validate.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "[${TIMESTAMP}] Another validation is already running — exiting."
+    exit 0
+fi
+
+# ─── Helpers ───
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+send_alert() {
+    python3 "$ALERT_SCRIPT" "$1" "$2" 2>/dev/null || true
+}
+
+FAILURES=()
+
+fail() {
+    local phase="$1" msg="$2"
+    FAILURES+=("Phase ${phase}: ${msg}")
+    log "FAIL [Phase ${phase}]: ${msg}"
+}
+
+warn() {
+    log "WARN: $1"
+}
+
+# Run SQL against the restored DB. Returns query output.
+run_sql() {
+    PGPASSWORD="$RESTORE_PASSWORD" psql \
+        -h 127.0.0.1 -p "$RESTORE_PORT" \
+        -U "$DB_USER" -d "$DB_NAME" \
+        -t -A "$@" 2>&1
+}
+
+# ─── Phase 0: Setup ───
+
+log "=== Restore validation started for ${PROJECT_NAME} ==="
+
+cleanup() {
+    if [ -n "$RESTORE_CONTAINER" ]; then
+        docker rm -f "$RESTORE_CONTAINER" > /dev/null 2>&1 || true
+    fi
+    if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
+        rm -rf "$WORK_DIR"
+    fi
+}
+trap cleanup EXIT
+
+# Sweep any orphaned containers from prior crashed runs
+docker ps -a --filter "name=restore_validate_${PROJECT_NAME}" -q 2>/dev/null \
+    | xargs -r docker rm -f > /dev/null 2>&1 || true
+
+WORK_DIR=$(mktemp -d)
+log "Work directory: ${WORK_DIR}"
+
+# ─── Phase 1: Download latest backup from Box ───
+
+log "Phase 1: Downloading latest backup from Box..."
+
+if ! command -v rclone &> /dev/null; then
+    fail 1 "rclone not installed"
+    # Can't continue without rclone
+    log "=== Restore validation ABORTED ==="
+    echo "FAILED ${TIMESTAMP} phase=1 error=rclone_not_installed" > "${BACKUP_DIR}/.last_restore_validation"
+    send_alert "[Mac mini] Restore validation FAILED — ${PROJECT_NAME}" "rclone not installed. Cannot download backups from Box."
+    exit 1
+fi
+
+# Find the most recent dump on Box
+LATEST_DUMP=$(rclone lsf "${BOX_REMOTE_PATH}" --include "${DUMP_PATTERN}" 2>/dev/null | sort | tail -1)
+
+if [ -z "$LATEST_DUMP" ]; then
+    fail 1 "No dump files matching '${DUMP_PATTERN}' found at ${BOX_REMOTE_PATH}"
+else
+    log "Latest dump: ${LATEST_DUMP}"
+    rclone copy "${BOX_REMOTE_PATH}${LATEST_DUMP}" "$WORK_DIR/" 2>&1 | while IFS= read -r line; do log "  rclone: $line"; done
+
+    if [ ! -f "$WORK_DIR/$LATEST_DUMP" ]; then
+        fail 1 "Download failed — file not present after rclone copy"
+    fi
+
+    # Also download .counts and .schema sidecars if they exist
+    DUMP_BASE="${LATEST_DUMP%.dump}"
+    rclone copy "${BOX_REMOTE_PATH}${DUMP_BASE}.counts" "$WORK_DIR/" 2>/dev/null || true
+    rclone copy "${BOX_REMOTE_PATH}${DUMP_BASE}.schema.gz" "$WORK_DIR/" 2>/dev/null || true
+fi
+
+# Abort if Phase 1 failed
+if [ ${#FAILURES[@]} -gt 0 ]; then
+    log "=== Restore validation ABORTED at Phase 1 ==="
+    echo "FAILED ${TIMESTAMP} phase=1 error=${FAILURES[0]}" > "${BACKUP_DIR}/.last_restore_validation"
+    send_alert "[Mac mini] Restore validation FAILED — ${PROJECT_NAME}" "Phase 1 (download) failed: ${FAILURES[0]}"
+    exit 1
+fi
+
+# ─── Phase 2: Spin up ephemeral PostgreSQL container ───
+
+log "Phase 2: Starting ephemeral PostgreSQL container..."
+
+docker run -d --name "$RESTORE_CONTAINER" \
+    --publish 0:5432 \
+    -e POSTGRES_USER="$DB_USER" \
+    -e POSTGRES_DB="$DB_NAME" \
+    -e POSTGRES_PASSWORD="$RESTORE_PASSWORD" \
+    "$DOCKER_IMAGE" > /dev/null 2>&1
+
+# Extract the randomly assigned host port
+RESTORE_PORT=$(docker port "$RESTORE_CONTAINER" 5432/tcp 2>/dev/null | head -1 | cut -d: -f2)
+
+if [ -z "$RESTORE_PORT" ]; then
+    fail 2 "Could not determine container port"
+else
+    log "Container ${RESTORE_CONTAINER} on port ${RESTORE_PORT}"
+
+    # Wait for PostgreSQL to accept connections
+    for i in $(seq 1 30); do
+        if PGPASSWORD="$RESTORE_PASSWORD" pg_isready -h 127.0.0.1 -p "$RESTORE_PORT" -U "$DB_USER" > /dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+
+    if ! PGPASSWORD="$RESTORE_PASSWORD" pg_isready -h 127.0.0.1 -p "$RESTORE_PORT" -U "$DB_USER" > /dev/null 2>&1; then
+        fail 2 "PostgreSQL not ready after 30 seconds"
+    fi
+fi
+
+# Abort if Phase 2 failed
+if [ ${#FAILURES[@]} -gt 0 ]; then
+    log "=== Restore validation ABORTED at Phase 2 ==="
+    echo "FAILED ${TIMESTAMP} phase=2 error=${FAILURES[0]}" > "${BACKUP_DIR}/.last_restore_validation"
+    send_alert "[Mac mini] Restore validation FAILED — ${PROJECT_NAME}" "Phase 2 (container) failed: ${FAILURES[0]}"
+    exit 1
+fi
+
+# ─── Phase 3: L1 — Structural restore ───
+
+log "Phase 3: Restoring dump..."
+
+RESTORE_OUTPUT=$(PGPASSWORD="$RESTORE_PASSWORD" timeout 600 pg_restore \
+    -h 127.0.0.1 -p "$RESTORE_PORT" \
+    -U "$DB_USER" -d "$DB_NAME" \
+    --no-owner --no-acl \
+    "$WORK_DIR/$LATEST_DUMP" 2>&1) || true
+
+# pg_restore exits non-zero even for warnings; filter out known harmless messages
+RESTORE_ERRORS=$(echo "$RESTORE_OUTPUT" | grep -i "error" \
+    | grep -vi "already exists" \
+    | grep -vi "role" \
+    | grep -vi "transaction_timeout" \
+    | grep -vi "errors ignored on restore" \
+    || true)
+if [ -n "$RESTORE_ERRORS" ]; then
+    fail 3 "pg_restore errors: $(echo "$RESTORE_ERRORS" | head -3)"
+fi
+
+# Check all expected tables exist
+log "Verifying tables..."
+EXISTING_TABLES=$(run_sql -c "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public' ORDER BY tablename;")
+
+for table in $VALIDATE_TABLES; do
+    if ! echo "$EXISTING_TABLES" | grep -qw "$table"; then
+        fail 3 "Missing table: ${table}"
+    fi
+done
+
+# Check indexes exist
+INDEX_COUNT=$(run_sql -c "SELECT count(*) FROM pg_catalog.pg_indexes WHERE schemaname = 'public';")
+if [ -z "$INDEX_COUNT" ] || [ "$INDEX_COUNT" -lt 1 ]; then
+    fail 3 "No indexes found in restored database"
+else
+    log "  Indexes: ${INDEX_COUNT}"
+fi
+
+# Check constraints exist
+CONSTRAINT_COUNT=$(run_sql -c "SELECT count(*) FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_namespace n ON n.oid = c.connamespace WHERE n.nspname = 'public';")
+if [ -z "$CONSTRAINT_COUNT" ] || [ "$CONSTRAINT_COUNT" -lt 1 ]; then
+    fail 3 "No constraints found in restored database"
+else
+    log "  Constraints: ${CONSTRAINT_COUNT}"
+fi
+
+log "Phase 3 complete: $(echo "$EXISTING_TABLES" | wc -l | tr -d ' ') tables restored"
+
+# ─── Phase 4: L2 — Quantitative match ───
+
+log "Phase 4: Verifying row counts..."
+
+COUNTS_FILE="$WORK_DIR/${DUMP_BASE}.counts"
+if [ -f "$COUNTS_FILE" ]; then
+    while IFS= read -r line; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^# ]] && continue
+        [[ -z "$line" ]] && continue
+        # Skip checksum lines (handled in Phase 5)
+        [[ "$line" =~ _md5= ]] && continue
+
+        table=$(echo "$line" | cut -d= -f1)
+        expected=$(echo "$line" | cut -d= -f2)
+        actual=$(run_sql -c "SELECT count(*) FROM ${table};" 2>/dev/null || echo "ERROR")
+
+        if [ "$actual" = "ERROR" ]; then
+            fail 4 "Could not count ${table}"
+        elif [ "$actual" != "$expected" ]; then
+            fail 4 "Count mismatch: ${table} expected=${expected} got=${actual}"
+        else
+            log "  ${table}: ${actual} ✓"
+        fi
+    done < "$COUNTS_FILE"
+else
+    warn "No .counts sidecar found for ${LATEST_DUMP}. Upgrade backup script to generate .counts files."
+fi
+
+# ─── Phase 5: L3 — Content checksums ───
+
+log "Phase 5: Verifying checksums..."
+
+if [ -f "$COUNTS_FILE" ] && [ -n "$CHECKSUM_TABLES" ]; then
+    for table in $CHECKSUM_TABLES; do
+        expected_cksum=$(grep "^${table}_md5=" "$COUNTS_FILE" 2>/dev/null | cut -d= -f2 || true)
+        if [ -z "$expected_cksum" ] || [ "$expected_cksum" = "ERROR" ]; then
+            warn "No checksum in sidecar for ${table}. Upgrade backup script to generate checksums."
+            continue
+        fi
+
+        # Use the same checksum query as backup.sh
+        # Source the checksum_query function from backup.sh template if available,
+        # otherwise use generic fallback
+        case "$table" in
+            transactions)
+                CKSUM_SQL="SELECT md5(sum(id)::text || '|' || count(*)::text || '|' || coalesce(sum(abs(amount)),0)::text) FROM transactions;" ;;
+            vendors)
+                CKSUM_SQL="SELECT md5(sum(id)::text || '|' || count(*)::text || '|' || md5(coalesce(string_agg(name, ',' ORDER BY id), ''))) FROM vendors;" ;;
+            submitted_reports)
+                CKSUM_SQL="SELECT md5(sum(id)::text || '|' || count(*)::text) FROM submitted_reports;" ;;
+            persons)
+                CKSUM_SQL="SELECT md5(sum(id)::text || '|' || count(*)::text) FROM persons;" ;;
+            *)
+                CKSUM_SQL="SELECT md5(sum(id)::text || '|' || count(*)::text) FROM ${table};" ;;
+        esac
+
+        actual_cksum=$(run_sql -c "$CKSUM_SQL" 2>/dev/null || echo "ERROR")
+
+        if [ "$actual_cksum" = "ERROR" ]; then
+            fail 5 "Could not compute checksum for ${table}"
+        elif [ "$actual_cksum" != "$expected_cksum" ]; then
+            fail 5 "Checksum mismatch: ${table} expected=${expected_cksum} got=${actual_cksum}"
+        else
+            log "  ${table}: checksum match ✓"
+        fi
+    done
+elif [ ! -f "$COUNTS_FILE" ]; then
+    warn "No .counts sidecar — skipping checksum verification"
+else
+    warn "No CHECKSUM_TABLES configured — skipping checksum verification"
+fi
+
+# ─── Phase 6: L4 — Functional verification ───
+
+log "Phase 6: Functional verification..."
+
+# Run project-specific canary queries if available
+if [ -n "$VALIDATE_SQL" ] && [ -f "$VALIDATE_SQL" ]; then
+    log "  Running canary queries from ${VALIDATE_SQL}..."
+    SQL_OUTPUT=$(PGPASSWORD="$RESTORE_PASSWORD" psql \
+        -h 127.0.0.1 -p "$RESTORE_PORT" \
+        -U "$DB_USER" -d "$DB_NAME" \
+        -f "$VALIDATE_SQL" 2>&1) || {
+        fail 6 "Canary queries failed: $(echo "$SQL_OUTPUT" | grep -i "error" | head -3)"
+    }
+    if [ $? -eq 0 ]; then
+        log "  Canary queries: passed ✓"
+    fi
+elif [ -n "$VALIDATE_SQL" ]; then
+    warn "VALIDATE_SQL configured but file not found: ${VALIDATE_SQL}"
+else
+    log "  No canary queries configured — skipping"
+fi
+
+# Schema drift detection (informational, not a failure)
+SCHEMA_SIDECAR="$WORK_DIR/${DUMP_BASE}.schema.gz"
+if [ -f "$SCHEMA_SIDECAR" ]; then
+    log "  Comparing schema against sidecar..."
+    RESTORED_SCHEMA=$(PGPASSWORD="$RESTORE_PASSWORD" pg_dump --schema-only \
+        -h 127.0.0.1 -p "$RESTORE_PORT" \
+        -U "$DB_USER" -d "$DB_NAME" 2>/dev/null)
+    SIDECAR_SCHEMA=$(gunzip -c "$SCHEMA_SIDECAR" 2>/dev/null)
+
+    # Extract table/index/constraint names for structural comparison
+    RESTORED_TABLES=$(echo "$RESTORED_SCHEMA" | grep "^CREATE TABLE" | sort)
+    SIDECAR_TABLES=$(echo "$SIDECAR_SCHEMA" | grep "^CREATE TABLE" | sort)
+
+    SCHEMA_DIFF=$(diff <(echo "$SIDECAR_TABLES") <(echo "$RESTORED_TABLES") 2>/dev/null || true)
+    if [ -n "$SCHEMA_DIFF" ]; then
+        warn "Schema drift detected (informational):"
+        echo "$SCHEMA_DIFF" | while IFS= read -r line; do warn "  $line"; done
+    else
+        log "  Schema: matches sidecar ✓"
+    fi
+else
+    log "  No .schema sidecar — skipping drift detection"
+fi
+
+# ─── Phase 7: Report ───
+
+STATUS_FILE="${BACKUP_DIR}/.last_restore_validation"
+
+if [ ${#FAILURES[@]} -gt 0 ]; then
+    log "=== Restore validation FAILED (${#FAILURES[@]} failure(s)) ==="
+    for f in "${FAILURES[@]}"; do
+        log "  - $f"
+    done
+
+    FAILURE_SUMMARY=$(printf '%s\n' "${FAILURES[@]}")
+    echo "FAILED ${TIMESTAMP} dump=${LATEST_DUMP} failures=${#FAILURES[@]}" > "$STATUS_FILE"
+
+    # Write detailed report for SessionStart hook
+    {
+        echo "# Restore Validation Failed — ${PROJECT_NAME}"
+        echo ""
+        echo "**When:** ${TIMESTAMP}"
+        echo "**Dump:** ${LATEST_DUMP}"
+        echo ""
+        echo "## Failures"
+        echo ""
+        for f in "${FAILURES[@]}"; do
+            echo "- $f"
+        done
+    } > "$HOME/.claude/restore-validation-report.md"
+
+    send_alert \
+        "[Mac mini] Restore validation FAILED — ${PROJECT_NAME}" \
+        "Weekly restore validation failed at ${TIMESTAMP}.
+Dump: ${LATEST_DUMP}
+
+Failures:
+${FAILURE_SUMMARY}
+
+Check: ${BACKUP_DIR}/validation.log"
+
+    exit 1
+else
+    log "=== Restore validation PASSED ==="
+    log "  Dump: ${LATEST_DUMP}"
+    echo "OK ${TIMESTAMP} dump=${LATEST_DUMP}" > "$STATUS_FILE"
+
+    # Clean up any prior failure report
+    rm -f "$HOME/.claude/restore-validation-report.md"
+fi

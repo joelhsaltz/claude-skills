@@ -1,0 +1,57 @@
+-- Level 4 functional verification canary queries
+-- These run against the RESTORED database (throwaway container).
+-- All queries must complete without error. Any SQL error = validation failure.
+--
+-- Customize for your project. Good canary queries exercise:
+--   - Cross-table JOINs (FK integrity)
+--   - Index-dependent operations (EXPLAIN, JSONB containment)
+--   - Aggregate queries (catch partial restore)
+--   - Constraint enforcement (catch missing constraints)
+
+-- Example: financial-tracker canary queries
+
+-- 1. Cross-table JOIN: transactions → vendors (FK integrity)
+SELECT t.id, v.name
+FROM transactions t
+JOIN vendors v ON v.id = t.vendor_id
+WHERE t.vendor_id IS NOT NULL
+LIMIT 5;
+
+-- 2. JSONB GIN index probe (verify index is usable, not just present)
+EXPLAIN SELECT * FROM line_items
+WHERE tags @> '[{"system":"product_type","code":"appliance"}]';
+
+-- 3. Submitted reports with JSONB snapshot
+SELECT id, title, jsonb_array_length(snapshot->'transactions') as txn_count
+FROM submitted_reports
+WHERE status != 'superseded'
+LIMIT 3;
+
+-- 4. Cross-table aggregate (breaks on partial restore)
+SELECT
+    COUNT(DISTINCT t.id) as transactions,
+    COUNT(DISTINCT v.id) as vendors,
+    COUNT(DISTINCT e.id) as emails
+FROM transactions t
+LEFT JOIN vendors v ON v.id = t.vendor_id
+LEFT JOIN emails e ON e.account = t.source;
+
+-- 5. Check constraint enforcement test
+-- Attempts an invalid insert; expects check_violation exception.
+-- Uses a DO block so the invalid row is never committed.
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO transactions(
+            txn_hash, source, txn_date, amount, description,
+            raw_row, import_batch, evidence_status
+        ) VALUES (
+            'validate_test', 'test', NOW(), 0, 'validation canary',
+            '{}', gen_random_uuid(), 'invalid_status_that_should_fail'
+        );
+        RAISE EXCEPTION 'FAIL: check constraint not enforced on evidence_status';
+    EXCEPTION WHEN check_violation THEN
+        -- Expected — constraint is working
+        NULL;
+    END;
+END $$;

@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# SessionStart hook: checks backup health across all projects.
+# Register in ~/.claude/settings.json under SessionStart hooks.
+# Outputs warnings as plain text (shown to user at session start).
+# Silent when everything is healthy.
+
+# ─── CONFIGURE ───────────────────────────────────────────────────────────────
+# Format: "display_name:backup_dir"
+BACKUP_SOURCES=(
+    # "financial-tracker:/Users/aitestbed/projects/financial-tracker/backups"
+    # "email-project:/Users/aitestbed/projects/email-project/backups"
+)
+
+MAX_BACKUP_AGE_HOURS=13        # Warn if newest .dump older than this (12h cron + 1h slack)
+MAX_RESTORE_AGE_DAYS=8         # Warn if restore validation older than this (weekly + 1 day grace)
+
+ALERT_SCRIPT="$HOME/.claude/skills/backup-to-box/templates/send_alert_standalone.py"
+# ─────────────────────────────────────────────────────────────────────────────
+
+warnings=()
+now_epoch=$(date +%s)
+
+for source in "${BACKUP_SOURCES[@]}"; do
+    name="${source%%:*}"
+    dir="${source#*:}"
+
+    if [ ! -d "$dir" ]; then
+        warnings+=("WARNING [${name}]: Backup directory not found: ${dir}")
+        continue
+    fi
+
+    # ── Check 1: Dump age ──
+
+    latest=$(ls -t "$dir"/*.dump 2>/dev/null | head -1)
+
+    if [ -z "$latest" ]; then
+        warnings+=("WARNING [${name}]: No backup dumps found in ${dir}")
+        continue
+    fi
+
+    # macOS stat for mtime
+    file_epoch=$(stat -f%m "$latest" 2>/dev/null || stat -c%Y "$latest" 2>/dev/null)
+    age_hours=$(( (now_epoch - file_epoch) / 3600 ))
+
+    if [ "$age_hours" -ge "$MAX_BACKUP_AGE_HOURS" ]; then
+        warnings+=("WARNING [${name}]: Last backup is ${age_hours}h old ($(basename "$latest")). Cron may not be running — check Full Disk Access for cron in System Settings > Privacy & Security.")
+    fi
+
+    # ── Check 2: Box.com sync status ──
+
+    sync_status_file="${dir}/.last_sync_status"
+    if [ -f "$sync_status_file" ]; then
+        sync_line=$(head -1 "$sync_status_file")
+        case "$sync_line" in
+            FAILED*)
+                warnings+=("WARNING [${name}]: Box.com sync FAILED on last backup. Run: rclone config reconnect box:")
+                ;;
+            SKIPPED*)
+                warnings+=("WARNING [${name}]: Box.com sync was skipped (rclone not configured).")
+                ;;
+        esac
+    elif [ "$age_hours" -lt "$MAX_BACKUP_AGE_HOURS" ]; then
+        warnings+=("WARNING [${name}]: No Box.com sync status recorded. Sync may not have run.")
+    fi
+
+    # ── Check 3: Restore validation status ──
+
+    restore_status_file="${dir}/.last_restore_validation"
+    if [ -f "$restore_status_file" ]; then
+        restore_line=$(head -1 "$restore_status_file")
+        case "$restore_line" in
+            OK*)
+                # Extract timestamp and check age
+                restore_ts=$(echo "$restore_line" | awk '{print $2, $3}')
+                restore_epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$restore_ts" +%s 2>/dev/null || \
+                                date -d "$restore_ts" +%s 2>/dev/null || echo "0")
+                if [ "$restore_epoch" -gt 0 ]; then
+                    restore_age_days=$(( (now_epoch - restore_epoch) / 86400 ))
+                    if [ "$restore_age_days" -ge "$MAX_RESTORE_AGE_DAYS" ]; then
+                        warnings+=("WARNING [${name}]: Restore validation is ${restore_age_days} days old (last: ${restore_ts}). Run: backup/validate_restore.sh")
+                    fi
+                fi
+                ;;
+            FAILED*)
+                warnings+=("WARNING [${name}]: Restore validation FAILED. Check backup/validation.log")
+                ;;
+        esac
+    else
+        warnings+=("WARNING [${name}]: No restore validation on record. Run: validate_restore.sh with project config")
+    fi
+done
+
+# ── Output warnings ──
+
+if [ ${#warnings[@]} -gt 0 ]; then
+    echo ""
+    echo "━━━ Backup Health Warnings ━━━"
+    for w in "${warnings[@]}"; do
+        echo "$w"
+    done
+    echo ""
+
+    # Also send email alert
+    ALERT_BODY=$(printf '%s\n' "${warnings[@]}")
+    python3 "$ALERT_SCRIPT" \
+        "[Mac mini] Backup health warnings" \
+        "$ALERT_BODY" 2>/dev/null || true
+fi
+
+# ── Surface one-time reports ──
+
+RESTORE_REPORT="$HOME/.claude/restore-validation-report.md"
+if [ -f "$RESTORE_REPORT" ]; then
+    echo ""
+    cat "$RESTORE_REPORT"
+    rm -f "$RESTORE_REPORT"
+fi
+
+CONSISTENCY_REPORT="$HOME/.claude/consistency-report.md"
+if [ -f "$CONSISTENCY_REPORT" ]; then
+    echo ""
+    cat "$CONSISTENCY_REPORT"
+    rm -f "$CONSISTENCY_REPORT"
+fi
